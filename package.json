@@ -1,0 +1,14 @@
+{
+  "name": "server",
+  "version": "1.0.0",
+  "description": "Servidor multijugador WebSocket independiente para Brillant",
+  "type": "commonjs",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "ws": "^8.22.2"
+  }
+}
