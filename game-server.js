@@ -158,6 +158,9 @@ class BrillantServer {
       mapId: payload.mapId,
       gameStarted: false,
       gameOver: false,
+      phase: 'lobby',
+      dice: null,
+      pendingMoves: new Map(),
       gamePlayerIds: new Set(),
       players: new Map([[player.id, player]]),
       scores: new Map([[player.id, { playerId: player.id, playerName: name, total: 0 }]]),
@@ -177,6 +180,7 @@ class BrillantServer {
     const room = this.rooms.get(code);
     if (!room) throw new RequestError('No existe una sala con ese código.');
     if (room.gameStarted) throw new RequestError('La partida ya comenzó; no se aceptan más jugadores.');
+    if (room.phase !== 'lobby') throw new RequestError('La sala ya pasó a la preparación del tablero.');
     const name = this.validatePlayerName(payload.playerName);
     const player = this.newPlayer(name, socket, room.mapId);
     room.players.set(player.id, player);
@@ -194,81 +198,98 @@ class BrillantServer {
     if (typeof payload.ready !== 'boolean') {
       throw new RequestError('ready debe ser un valor booleano.');
     }
-    if (room.gameOver && payload.ready) {
-      throw new RequestError('La partida ya terminó.');
-    }
+    if (room.phase !== 'lobby') throw new RequestError('El lobby ya terminó.');
     player.ready = payload.ready;
-    const startedEvents = [];
-    if (room.gameStarted) {
-      if (player.ready) {
-        room.gamePlayerIds.add(player.id);
-        startedEvents.push({
-          sockets: [player.socket],
-          type: 'game_started',
-          data: this.roomData(room, player),
-        });
-      } else {
-        room.gamePlayerIds.delete(player.id);
-      }
-    } else if ([...room.players.values()].filter((item) => item.ready).length >= 2) {
-      room.gameStarted = true;
-      room.gamePlayerIds = new Set(
-        [...room.players.values()].filter((item) => item.ready).map((item) => item.id),
-      );
-      for (const readyPlayer of room.players.values()) {
-        if (room.gamePlayerIds.has(readyPlayer.id)) {
-          startedEvents.push({
-            sockets: [readyPlayer.socket],
-            type: 'game_started',
-            data: this.roomData(room, readyPlayer),
-          });
-        }
-      }
+    if (room.players.size >= 2 &&
+        [...room.players.values()].every((roomPlayer) => roomPlayer.ready)) {
+      room.phase = 'initial_board';
     }
-    const events = [...this.roomStateEvents(room), ...startedEvents];
-    this.appendGameOverIfComplete(room, events);
-    return { data: { ready: player.ready, gameStarted: room.gameStarted }, events };
+    return {
+      data: { ready: player.ready, gameStarted: room.gameStarted, phase: room.phase },
+      events: this.roomStateEvents(room),
+    };
   }
 
   leaveRoom(socket, state) {
     const { room, player } = this.requirePlayer(state);
     room.players.delete(player.id);
+    room.gamePlayerIds.delete(player.id);
+    room.pendingMoves.delete(player.id);
     state.roomCode = null;
     state.playerId = null;
+    this.resetLobbyIfUnderpopulated(room);
     const events = [];
     if (room.players.size === 0) {
       this.rooms.delete(room.code);
     } else {
       events.push(...this.roomStateEvents(room), this.scoreEvent(room));
+      if (this.allPlayersConfirmed(room)) this.completeRound(room, events);
     }
     return { data: { left: true }, events };
   }
 
   submitInitialBoard(socket, state, payload) {
     const { room, player } = this.requirePlayer(state);
-    this.assertActivePlayer(room, player);
+    if (room.gameStarted) throw new RequestError('La partida ya comenzó.');
+    if (room.phase !== 'initial_board') {
+      throw new RequestError('Todos los jugadores deben estar listos en el lobby antes de preparar el tablero.');
+    }
     if (player.submitted) throw new RequestError('El tablero inicial ya fue enviado.');
+    if (payload.ready !== true) throw new RequestError('ready debe ser true para confirmar el tablero inicial.');
     const assignments = this.validateInitialAssignments(MAPS[room.mapId], payload.assignments);
     player.board = assignments;
     player.submitted = true;
 
-    const events = [{
-      sockets: [player.socket],
-      type: 'board_state',
-      data: this.boardData(room, player),
-    }];
-    this.awardCompletedZones(room, player);
-    events.push(this.scoreEvent(room));
-    this.rollForPlayer(player, events, room);
-    this.appendGameOverIfComplete(room, events);
+    let events;
+    if (this.canStartGame(room)) {
+      room.gameStarted = true;
+      room.phase = 'game';
+      room.gamePlayerIds = new Set([...room.players.keys()]);
+      for (const readyPlayer of room.players.values()) readyPlayer.ready = false;
+      for (const readyPlayer of room.players.values()) {
+        this.awardCompletedZones(room, readyPlayer);
+      }
+      const recipients = [...room.players.values()].map((roomPlayer) => roomPlayer.socket);
+      events = [
+        ...this.roomStateEvents(room),
+        ...[...room.players.values()].map((roomPlayer) => ({
+          sockets: recipients,
+          type: 'board_state',
+          data: this.boardData(room, roomPlayer),
+        })),
+        this.scoreEvent(room),
+      ];
+      for (const readyPlayer of room.players.values()) {
+        events.push({
+          sockets: [readyPlayer.socket],
+          type: 'game_started',
+          data: this.roomData(room, readyPlayer),
+        });
+      }
+      this.rollForRoom(room, events);
+    } else {
+      events = [
+        ...this.roomStateEvents(room),
+        {
+          sockets: [player.socket],
+          type: 'board_state',
+          data: this.boardData(room, player),
+        },
+      ];
+    }
     return { data: { assignments: this.serializeBoard(player.board) }, events };
   }
 
   placeNumber(socket, state, payload) {
     const { room, player } = this.requirePlayer(state);
     this.assertActivePlayer(room, player);
+    if (player.finished) throw new RequestError('Tu tablero ya está completo.');
     if (!player.submitted) throw new RequestError('Envía primero el tablero inicial.');
-    if (!player.dice) throw new RequestError('No hay una tirada vigente.');
+    if (payload.ready !== true) throw new RequestError('ready debe ser true para confirmar la jugada.');
+    if (room.pendingMoves.has(player.id)) {
+      throw new RequestError('Ya confirmaste tu jugada para esta ronda.');
+    }
+    if (!room.dice) throw new RequestError('No hay una tirada vigente.');
     const { row, column, number } = payload;
     if (!isIntegerInRange(row, 0, BOARD_SIZE - 1) ||
         !isIntegerInRange(column, 0, BOARD_SIZE - 1)) {
@@ -277,14 +298,31 @@ class BrillantServer {
     if (!isIntegerInRange(number, 1, 6)) {
       throw new RequestError('number debe ser un entero entre 1 y 6.');
     }
-    if (!player.dice.includes(number)) {
-      throw new RequestError('number no coincide con ninguno de los dados vigentes.');
+    if (!room.dice.includes(number)) {
+      throw new RequestError(
+        `number (${number}) no coincide con los dados vigentes [${room.dice.join(', ')}].`,
+      );
     }
 
     const key = coordinateKey(row, column);
     if (player.board.has(key)) throw new RequestError('La casilla ya está ocupada.');
-    if (!isAdjacentToComplement(player, row, column, number)) {
-      throw new RequestError('La casilla debe ser ortogonalmente adyacente al dado complementario.');
+    if (!isAdjacentToComplement(player, room.dice, row, column, number)) {
+      const requiredNeighbor = complementaryDiceValue(room.dice, number);
+      const neighbors = [
+        [row - 1, column],
+        [row + 1, column],
+        [row, column - 1],
+        [row, column + 1],
+      ]
+        .filter(([neighborRow, neighborColumn]) =>
+          neighborRow >= 0 && neighborRow < BOARD_SIZE &&
+          neighborColumn >= 0 && neighborColumn < BOARD_SIZE)
+        .map(([neighborRow, neighborColumn]) =>
+          `${neighborRow},${neighborColumn}:${player.board.get(coordinateKey(neighborRow, neighborColumn)) ?? '-'}`);
+      throw new RequestError(
+        `La casilla (${row},${column}) con number ${number} requiere un vecino ortogonal con ${requiredNeighbor}; ` +
+        `dados vigentes [${room.dice.join(', ')}], vecinos actuales [${neighbors.join(', ')}].`,
+      );
     }
     const nextBoard = new Map(player.board);
     nextBoard.set(key, number);
@@ -292,32 +330,34 @@ class BrillantServer {
       throw new RequestError('El número incumple las reglas de la zona.');
     }
 
-    player.board = nextBoard;
-    player.dice = null;
-    this.awardCompletedZones(room, player);
-    const events = [{
-      sockets: [player.socket],
-      type: 'board_state',
-      data: this.boardData(room, player),
-    }, this.scoreEvent(room)];
-    this.rollForPlayer(player, events, room);
-    this.appendGameOverIfComplete(room, events);
-    return { data: { placed: true, assignments: this.serializeBoard(player.board) }, events };
+    room.pendingMoves.set(player.id, { row, column, number });
+    const events = this.roomStateEvents(room);
+    const roundCompleted = this.allPlayersConfirmed(room);
+    if (roundCompleted) this.completeRound(room, events);
+    return {
+      data: {
+        placed: true,
+        pending: !roundCompleted,
+        assignments: this.serializeBoard(player.board),
+      },
+      events,
+    };
   }
 
   skipTurn(socket, state) {
     const { room, player } = this.requirePlayer(state);
     this.assertActivePlayer(room, player);
+    if (player.finished) throw new RequestError('Tu tablero ya está completo.');
     if (!player.submitted) throw new RequestError('Envía primero el tablero inicial.');
-    if (!player.dice) throw new RequestError('No hay una tirada vigente.');
-    player.dice = null;
-    const events = [{
-      sockets: [player.socket],
-      type: 'board_state',
-      data: this.boardData(room, player),
-    }, this.scoreEvent(room)];
-    this.rollForPlayer(player, events, room);
-    return { data: { skipped: true }, events };
+    if (room.pendingMoves.has(player.id)) {
+      throw new RequestError('Ya confirmaste tu jugada para esta ronda.');
+    }
+    if (!room.dice) throw new RequestError('No hay una tirada vigente.');
+    room.pendingMoves.set(player.id, { skip: true });
+    const events = this.roomStateEvents(room);
+    const roundCompleted = this.allPlayersConfirmed(room);
+    if (roundCompleted) this.completeRound(room, events);
+    return { data: { skipped: true, pending: !roundCompleted }, events };
   }
 
   onDisconnect(socket, state) {
@@ -328,12 +368,16 @@ class BrillantServer {
     const player = room.players.get(state.playerId);
     if (!player) return;
     room.players.delete(player.id);
+    room.gamePlayerIds.delete(player.id);
+    room.pendingMoves.delete(player.id);
+    this.resetLobbyIfUnderpopulated(room);
     if (room.players.size === 0) {
       this.rooms.delete(room.code);
     } else {
       this.broadcastRoomState(room);
       this.broadcastScore(room);
       const events = [];
+      if (this.allPlayersConfirmed(room)) this.completeRound(room, events);
       this.appendGameOverIfComplete(room, events);
       for (const event of events) this.emit(event.sockets, event.type, event.data);
     }
@@ -385,7 +429,6 @@ class BrillantServer {
       mapId,
       board: new Map(),
       submitted: false,
-      dice: null,
       finished: false,
     };
   }
@@ -411,8 +454,62 @@ class BrillantServer {
   }
 
   assertActivePlayer(room, player) {
-    if (!room.gameStarted || !room.gamePlayerIds.has(player.id) || !player.ready) {
+    if (!room.gameStarted || room.gameOver || !room.gamePlayerIds.has(player.id)) {
       throw new RequestError('Debes estar listo en una partida iniciada.');
+    }
+  }
+
+  allPlayersConfirmed(room) {
+    const activePlayers = [...room.gamePlayerIds].filter((playerId) => {
+      const player = room.players.get(playerId);
+      return player && !player.finished;
+    });
+    return activePlayers.length > 0 &&
+      activePlayers.every((playerId) => room.pendingMoves.has(playerId));
+  }
+
+  completeRound(room, events) {
+    const confirmedPlayerIds = [...room.gamePlayerIds].filter((playerId) => {
+      const player = room.players.get(playerId);
+      return player && !player.finished;
+    });
+    const moves = confirmedPlayerIds
+      .map((playerId) => [room.players.get(playerId), room.pendingMoves.get(playerId)])
+      .filter(([player, move]) => player && move);
+    room.dice = null;
+    for (const [player, move] of moves) {
+      if (move.skip) continue;
+      player.board.set(coordinateKey(move.row, move.column), move.number);
+      player.finished = player.board.size >= BOARD_SIZE * BOARD_SIZE;
+    }
+    room.pendingMoves.clear();
+    for (const [player] of moves) this.awardCompletedZones(room, player);
+    const recipients = [...room.players.values()].map((player) => player.socket);
+    for (const [player] of moves) {
+      events.push({
+        sockets: recipients,
+        type: 'board_state',
+        data: this.boardData(room, player),
+      });
+    }
+    events.push(this.scoreEvent(room));
+    this.appendGameOverIfComplete(room, events);
+    if (!room.gameOver) this.rollForRoom(room, events);
+    events.push(...this.roomStateEvents(room));
+  }
+
+  canStartGame(room) {
+    return room.players.size >= 2 &&
+      [...room.players.values()].every((player) => player.submitted && player.ready);
+  }
+
+  resetLobbyIfUnderpopulated(room) {
+    if (room.gameStarted || room.phase !== 'initial_board' || room.players.size >= 2) return;
+    room.phase = 'lobby';
+    for (const player of room.players.values()) {
+      player.ready = false;
+      player.submitted = false;
+      player.board = new Map();
     }
   }
 
@@ -422,6 +519,7 @@ class BrillantServer {
       playerId: recipient.id,
       mapId: room.mapId,
       gameStarted: room.gameStarted,
+      phase: room.phase,
       players: [...room.players.values()].map(({ id, name, ready }) => ({ id, name, ready })),
     };
   }
@@ -498,22 +596,21 @@ class BrillantServer {
     this.emit([...room.players.values()].map((player) => player.socket), 'score_update', this.scoreSnapshot(room));
   }
 
-  rollForPlayer(player, events, room) {
-    if (player.board.size >= BOARD_SIZE * BOARD_SIZE) {
-      player.finished = true;
-      player.dice = null;
-      return;
-    }
+  rollForRoom(room, events) {
     const values = this.diceRoller();
     if (!Array.isArray(values) || values.length !== 2 ||
         values.some((value) => !isIntegerInRange(value, 1, 6))) {
       throw new Error('Dice roller must return two integers between 1 and 6.');
     }
-    player.dice = [...values];
+    room.dice = [...values];
+    const confirmedPlayerIds = [...room.gamePlayerIds].filter((playerId) => {
+      const player = room.players.get(playerId);
+      return player && !player.finished;
+    });
     events.push({
-      sockets: [player.socket],
+      sockets: [...room.players.values()].map((player) => player.socket),
       type: 'dice_rolled',
-      data: { values: [...player.dice] },
+      data: { values: [...room.dice], confirmedPlayerIds },
     });
   }
 
@@ -556,7 +653,8 @@ function buildScoringZones(map) {
     }
   }
 
-  for (const type of ['yellow', 'white']) {
+  const globalScoringTypes = new Set(['yellow', 'white', ...(map.scoringGroups || [])]);
+  for (const type of globalScoringTypes) {
     const cells = allPositions.filter(([row, column]) => map.cells[row][column] === type);
     if (cells.length) zones.push({ id: type, type, cells, points: POINTS_BY_TYPE[type] });
   }
@@ -565,7 +663,7 @@ function buildScoringZones(map) {
   for (let row = 0; row < BOARD_SIZE; row++) {
     for (let column = 0; column < BOARD_SIZE; column++) {
       const type = map.cells[row][column];
-      if (type === 'yellow' || type === 'white') continue;
+      if (globalScoringTypes.has(type)) continue;
       const startKey = coordinateKey(row, column);
       if (visited.has(startKey)) continue;
       const stack = [[row, column]];
@@ -662,15 +760,19 @@ function validateBoardRules(map, board) {
   return true;
 }
 
-function isAdjacentToComplement(player, row, column, number) {
-  const [first, second] = player.dice;
-  const requiredNeighbor = number === first ? second : first;
+function isAdjacentToComplement(player, dice, row, column, number) {
+  const requiredNeighbor = complementaryDiceValue(dice, number);
   return [
     [row - 1, column],
     [row + 1, column],
     [row, column - 1],
     [row, column + 1],
   ].some(([r, c]) => player.board.get(coordinateKey(r, c)) === requiredNeighbor);
+}
+
+function complementaryDiceValue(dice, number) {
+  const [first, second] = dice;
+  return number === first ? second : first;
 }
 
 async function startServer(options = {}) {

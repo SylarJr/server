@@ -50,6 +50,7 @@ const MAPS = [
   {
     name: 'Mapa 3',
     marked: [[0, 4], [2, 2], [2, 5], [3, 0], [5, 4], [6, 1]],
+    scoringGroups: ['blue', 'green'],
     cells: [
       ['orangeUpper', 'orangeUpper', 'orangeUpper', 'orangeUpper', 'orangeUpper', 'orangeUpper', 'orangeUpper'],
       ['yellow', 'red', 'blue', 'green', 'blue', 'red', 'yellow'],

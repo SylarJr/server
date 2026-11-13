@@ -30,10 +30,25 @@ El servidor responde con `response` y el mismo `requestId`; los eventos no
 solicitados tienen la forma `{ "type": "...", "data": { ... } }`.
 
 Las coordenadas son índices de fila y columna de base cero. Los dados se generan
-exclusivamente en el servidor. Cada jugador prepara una vez las seis posiciones
-marcadas con los valores 1–6; después puede colocar en cualquier casilla vacía,
-respetando la adyacencia ortogonal al dado complementario y las reglas de la
-zona. Las salas comienzan al tener al menos dos jugadores listos.
+exclusivamente en el servidor. Cada jugador envía `submit_initial_board` con
+exactamente las seis posiciones marcadas, los valores 1–6 sin repetir y
+`ready: true`. Crear o unirse a una sala, o enviar una señal de listo del lobby,
+no inicia la partida. Cuando hay al menos dos jugadores y todos usan
+`set_ready: true`, `room_state.phase` avanza a `initial_board`. La partida
+comienza solo cuando cada jugador envía un tablero válido y confirma con
+`ready: true`; entonces el servidor reinicia el estado `ready` del lobby, envía
+`game_started` y una única pareja `dice_rolled` compartida por todos. Tras cada
+tirada, `place_number` (con `ready: true`) y `skip_turn` registran una acción
+pendiente por jugador. La respuesta mantiene `ok: true` y `pending: true` si
+faltan confirmaciones; la acción del último jugador también responde `ok: true`,
+pero con `pending: false`, porque en esa misma operación se aplica la ronda.
+El servidor envía el estado actualizado de cada tablero y genera inmediatamente
+una pareja compartida. `dice_rolled` incluye
+`values` y los `confirmedPlayerIds` de todos los jugadores activos de la ronda.
+Los jugadores pueden colocar en cualquier casilla vacía, respetando la
+adyacencia ortogonal al dado complementario y las reglas de la zona.
+En el mapa 3, las casillas azules forman una zona de puntuación y las verdes
+otra; cada una puntúa solo cuando el jugador ha ocupado todas sus casillas.
 
 ## Pruebas
 
