@@ -700,11 +700,11 @@ function buildScoringZones(map) {
 
 function constraintRegion(map, row, column) {
   const type = map.cells[row][column];
-  if (type === 'white') {
+  if (type === 'white' || map.uniformNumberTypes?.includes(type)) {
     const cells = [];
     for (let r = 0; r < BOARD_SIZE; r++) {
       for (let c = 0; c < BOARD_SIZE; c++) {
-        if (map.cells[r][c] === 'white') cells.push([r, c]);
+        if (map.cells[r][c] === type) cells.push([r, c]);
       }
     }
     return cells;

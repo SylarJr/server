@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const { once } = require('node:events');
 const test = require('node:test');
 const WebSocket = require('ws');
-const { MAPS, buildScoringZones, startServer } = require('../game-server');
+const { MAPS, buildScoringZones, startServer, validateBoardRules } = require('../game-server');
 
 class TestClient {
   constructor(socket) {
@@ -669,6 +669,17 @@ test('map 3 blue and green scoring requires every cell of each color', async (t)
     room.zoneWinners.filter((winner) => winner.zoneId === greenZone.id).length,
     1,
   );
+});
+
+test('all blue cells on map 3 must use the same number', () => {
+  assert.equal(validateBoardRules(MAPS[3], new Map([
+    ['1,2', 4],
+    ['3,2', 4],
+  ])), true);
+  assert.equal(validateBoardRules(MAPS[3], new Map([
+    ['1,2', 4],
+    ['3,2', 5],
+  ])), false);
 });
 
 test('ports four 7x7 maps with the marked positions and a single yellow scoring zone', () => {

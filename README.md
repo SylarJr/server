@@ -48,7 +48,8 @@ una pareja compartida. `dice_rolled` incluye
 Los jugadores pueden colocar en cualquier casilla vacía, respetando la
 adyacencia ortogonal al dado complementario y las reglas de la zona.
 En el mapa 3, las casillas azules forman una zona de puntuación y las verdes
-otra; cada una puntúa solo cuando el jugador ha ocupado todas sus casillas.
+otra; cada una puntúa solo cuando el jugador ha ocupado todas sus casillas. Las
+casillas azules del mapa 3 deben tener todas el mismo número.
 
 ## Pruebas
 
