@@ -381,16 +381,12 @@ class BrillantServer {
     const events = [{
       sockets,
       type: 'player_left',
-      data: { playerId: player.id, playerName: player.name, reason },
+      data: { playerId: player.id, playerName: player.name },
     }];
 
     if (activeGame && room.players.size === 1) {
       const winner = room.players.values().next().value;
-      events.push({
-        sockets,
-        type: 'abandonment_winner',
-        data: { playerId: winner.id, playerName: winner.name },
-      });
+      events[0].data.winnerPlayerId = winner.id;
       this.resetGameToLobby(room);
       events.push(...this.roomStateEvents(room), this.scoreEvent(room));
       return events;

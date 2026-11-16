@@ -327,9 +327,10 @@ test('announces disconnected players and deletes an empty room after leave', asy
   await guest.nextMessage((message) => message.type === 'room_state');
   await host.close();
   const departure = await guest.nextMessage((message) => message.type === 'player_left');
-  assert.equal(departure.data.playerId, created.data.playerId);
-  assert.equal(departure.data.playerName, 'Ana');
-  assert.equal(departure.data.reason, 'disconnected');
+  assert.deepEqual(departure.data, {
+    playerId: created.data.playerId,
+    playerName: 'Ana',
+  });
   const state = await guest.nextMessage((message) => message.type === 'room_state');
   assert.equal(state.data.players.length, 1);
   assert.equal(state.data.players[0].name, 'Luis');
@@ -355,10 +356,10 @@ test('voluntary departure awards the sole survivor and resets the room for anoth
   assert.deepEqual(departure.data, {
     playerId: hostId,
     playerName: 'Ana',
-    reason: 'voluntary',
+    winnerPlayerId: guestId,
   });
-  const winner = await guest.nextMessage((message) => message.type === 'abandonment_winner');
-  assert.deepEqual(winner.data, { playerId: guestId, playerName: 'Luis' });
+  assert.equal(guest.messages.some((message) =>
+    message.type === 'abandonment_winner' || message.type === 'abandonment_dinner'), false);
   const state = await guest.nextMessage((message) => message.type === 'room_state');
   assert.equal(state.data.gameStarted, false);
   assert.equal(state.data.phase, 'lobby');
@@ -411,21 +412,38 @@ test('disconnecting one of several active players does not declare a winner', as
   await host.close();
   for (const player of [guest, third]) {
     const departure = await player.nextMessage((message) => message.type === 'player_left');
-    assert.equal(departure.data.playerId, hostId);
-    assert.equal(departure.data.playerName, 'Ana');
-    assert.equal(departure.data.reason, 'disconnected');
+    assert.deepEqual(departure.data, {
+      playerId: hostId,
+      playerName: 'Ana',
+    });
     await player.nextMessage((message) => message.type === 'room_state');
     await player.nextMessage((message) => message.type === 'score_update');
-    assert.equal(player.messages.some((message) => message.type === 'abandonment_winner'), false);
+    assert.equal(player.messages.some((message) =>
+      message.type === 'abandonment_winner' || message.type === 'abandonment_dinner'), false);
   }
   assert.equal(server.rooms.get(room).gameStarted, true);
+  const move = await guest.request('place_number', {
+    row: 0,
+    column: 1,
+    number: 2,
+    ready: true,
+  });
+  assert.equal(move.ok, true, move.error);
+  assert.equal(move.data.pending, true);
+  for (const player of [guest, third]) {
+    await player.nextMessage((message) => message.type === 'room_state');
+  }
+  assert.equal(server.rooms.get(room).pendingMoves.has(guestId), true);
 
   await guest.close();
   const departure = await third.nextMessage((message) => message.type === 'player_left');
-  assert.equal(departure.data.playerId, guestId);
-  assert.equal(departure.data.playerName, 'Luis');
-  const winner = await third.nextMessage((message) => message.type === 'abandonment_winner');
-  assert.deepEqual(winner.data, { playerId: thirdId, playerName: 'Eva' });
+  assert.deepEqual(departure.data, {
+    playerId: guestId,
+    playerName: 'Luis',
+    winnerPlayerId: thirdId,
+  });
+  assert.equal(third.messages.some((message) =>
+    message.type === 'abandonment_winner' || message.type === 'abandonment_dinner'), false);
   await third.nextMessage((message) => message.type === 'room_state');
   await third.nextMessage((message) => message.type === 'score_update');
   const roomState = server.rooms.get(room);
