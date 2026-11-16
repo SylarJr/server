@@ -56,53 +56,70 @@ async function connect(server) {
   return new TestClient(socket);
 }
 
-async function setupRoom({ mapId = 0, diceRoller = () => [1, 2] } = {}) {
+async function setupRoom({
+  mapId = 0,
+  diceRoller = () => [1, 2],
+  playerNames = ['Ana', 'Luis'],
+} = {}) {
   const server = await startServer({ host: '127.0.0.1', port: 0, diceRoller });
-  const host = await connect(server);
-  const created = await host.request('create_room', { mapId, playerName: 'Ana' });
+  const players = await Promise.all(playerNames.map(() => connect(server)));
+  const [host, guest] = players;
+  const created = await host.request('create_room', { mapId, playerName: playerNames[0] });
   assert.equal(created.ok, true);
-  const guest = await connect(server);
-  const joined = await guest.request('join_room', {
-    code: created.data.code,
-    playerName: 'Luis',
-  });
-  assert.equal(joined.ok, true);
-  await host.nextMessage((message) => message.type === 'room_state');
-  await guest.nextMessage((message) => message.type === 'room_state');
-  for (const player of [host, guest]) {
+  const joined = [];
+  for (const [index, player] of players.entries()) {
+    if (index === 0) continue;
+    const result = await player.request('join_room', {
+      code: created.data.code,
+      playerName: playerNames[index],
+    });
+    assert.equal(result.ok, true);
+    joined.push(result);
+  }
+  for (const [index, player] of players.entries()) {
+    const joinEvents = players.length - Math.max(index, 1);
+    for (let count = 0; count < joinEvents; count++) {
+      await player.nextMessage((message) => message.type === 'room_state');
+    }
+  }
+  for (const player of players) {
     const ready = await player.request('set_ready', { ready: true });
     assert.equal(ready.ok, true);
-    await host.nextMessage((message) => message.type === 'room_state');
-    await guest.nextMessage((message) => message.type === 'room_state');
+    for (const recipient of players) {
+      await recipient.nextMessage((message) => message.type === 'room_state');
+    }
   }
-  await host.request('submit_initial_board', {
-    assignments: mapZeroAssignments(),
-    ready: true,
-  });
-  await host.nextMessage((message) => message.type === 'room_state');
-  await guest.nextMessage((message) => message.type === 'room_state');
-  await host.nextMessage((message) => message.type === 'board_state');
-  await guest.request('submit_initial_board', {
-    assignments: mapZeroAssignments(),
-    ready: true,
-  });
-  await host.nextMessage((message) => message.type === 'room_state');
-  await guest.nextMessage((message) => message.type === 'room_state');
-  for (const player of [host, guest]) {
-    await player.nextMessage((message) => message.type === 'board_state');
-    await player.nextMessage((message) => message.type === 'board_state');
-  }
-  for (const player of [host, guest]) {
-    await player.nextMessage((message) => message.type === 'score_update');
-    await player.nextMessage((message) => message.type === 'game_started');
-    await player.nextMessage((message) => message.type === 'dice_rolled');
+  for (const [index, player] of players.entries()) {
+    const submitted = await player.request('submit_initial_board', {
+      assignments: mapZeroAssignments(),
+      ready: true,
+    });
+    assert.equal(submitted.ok, true);
+    for (const recipient of players) {
+      await recipient.nextMessage((message) => message.type === 'room_state');
+    }
+    if (index < players.length - 1) {
+      await player.nextMessage((message) => message.type === 'board_state');
+      continue;
+    }
+    for (const recipient of players) {
+      for (let count = 0; count < players.length; count++) {
+        await recipient.nextMessage((message) => message.type === 'board_state');
+      }
+      await recipient.nextMessage((message) => message.type === 'score_update');
+      await recipient.nextMessage((message) => message.type === 'game_started');
+      await recipient.nextMessage((message) => message.type === 'dice_rolled');
+    }
   }
   return {
     server,
     host,
     guest,
+    third: players[2],
+    players,
     hostId: created.data.playerId,
-    guestId: joined.data.playerId,
+    guestId: joined[0].data.playerId,
+    thirdId: joined[1]?.data.playerId,
     room: created.data.code,
   };
 }
@@ -294,7 +311,7 @@ test('starts only after every player submits a valid board and is ready', async 
   assert.deepEqual(secondDice.data.confirmedPlayerIds, firstDice.data.confirmedPlayerIds);
 });
 
-test('removes disconnected players and deletes an empty room after leave', async (t) => {
+test('announces disconnected players and deletes an empty room after leave', async (t) => {
   const server = await startServer({ host: '127.0.0.1', port: 0 });
   const host = await connect(server);
   const guest = await connect(server);
@@ -309,6 +326,10 @@ test('removes disconnected players and deletes an empty room after leave', async
   await host.nextMessage((message) => message.type === 'room_state');
   await guest.nextMessage((message) => message.type === 'room_state');
   await host.close();
+  const departure = await guest.nextMessage((message) => message.type === 'player_left');
+  assert.equal(departure.data.playerId, created.data.playerId);
+  assert.equal(departure.data.playerName, 'Ana');
+  assert.equal(departure.data.reason, 'disconnected');
   const state = await guest.nextMessage((message) => message.type === 'room_state');
   assert.equal(state.data.players.length, 1);
   assert.equal(state.data.players[0].name, 'Luis');
@@ -316,6 +337,101 @@ test('removes disconnected players and deletes an empty room after leave', async
   const left = await guest.request('leave_room');
   assert.equal(left.ok, true);
   assert.equal(server.rooms.size, 0);
+});
+
+test('voluntary departure awards the sole survivor and resets the room for another game', async (t) => {
+  const { server, host, guest, hostId, guestId, room } = await setupRoom();
+  const newcomer = await connect(server);
+  t.after(async () => {
+    await host.close();
+    await guest.close();
+    await newcomer.close();
+    await server.close();
+  });
+
+  const left = await host.request('leave_room');
+  assert.equal(left.ok, true);
+  const departure = await guest.nextMessage((message) => message.type === 'player_left');
+  assert.deepEqual(departure.data, {
+    playerId: hostId,
+    playerName: 'Ana',
+    reason: 'voluntary',
+  });
+  const winner = await guest.nextMessage((message) => message.type === 'abandonment_winner');
+  assert.deepEqual(winner.data, { playerId: guestId, playerName: 'Luis' });
+  const state = await guest.nextMessage((message) => message.type === 'room_state');
+  assert.equal(state.data.gameStarted, false);
+  assert.equal(state.data.phase, 'lobby');
+  await guest.nextMessage((message) => message.type === 'score_update');
+
+  const roomState = server.rooms.get(room);
+  const survivor = roomState.players.get(guestId);
+  assert.equal(roomState.gameOver, false);
+  assert.equal(roomState.dice, null);
+  assert.equal(roomState.pendingMoves.size, 0);
+  assert.equal(roomState.gamePlayerIds.size, 0);
+  assert.equal(roomState.zoneWinners.length, 0);
+  assert.deepEqual([...roomState.scores.values()], [
+    { playerId: guestId, playerName: 'Luis', total: 0 },
+  ]);
+  assert.equal(survivor.board.size, 0);
+  assert.equal(survivor.submitted, false);
+  assert.equal(survivor.finished, false);
+  assert.equal(survivor.ready, false);
+
+  const joined = await newcomer.request('join_room', {
+    code: room,
+    playerName: 'Eva',
+  });
+  assert.equal(joined.ok, true);
+  for (const player of [guest, newcomer]) {
+    await player.nextMessage((message) => message.type === 'room_state');
+  }
+  for (const player of [guest, newcomer]) {
+    const ready = await player.request('set_ready', { ready: true });
+    assert.equal(ready.ok, true);
+    for (const recipient of [guest, newcomer]) {
+      const lobbyState = await recipient.nextMessage((message) => message.type === 'room_state');
+      if (player === newcomer) assert.equal(lobbyState.data.phase, 'initial_board');
+    }
+  }
+});
+
+test('disconnecting one of several active players does not declare a winner', async (t) => {
+  const { server, host, guest, third, hostId, guestId, thirdId, room } = await setupRoom({
+    playerNames: ['Ana', 'Luis', 'Eva'],
+  });
+  t.after(async () => {
+    await host.close();
+    await guest.close();
+    await third.close();
+    await server.close();
+  });
+
+  await host.close();
+  for (const player of [guest, third]) {
+    const departure = await player.nextMessage((message) => message.type === 'player_left');
+    assert.equal(departure.data.playerId, hostId);
+    assert.equal(departure.data.playerName, 'Ana');
+    assert.equal(departure.data.reason, 'disconnected');
+    await player.nextMessage((message) => message.type === 'room_state');
+    await player.nextMessage((message) => message.type === 'score_update');
+    assert.equal(player.messages.some((message) => message.type === 'abandonment_winner'), false);
+  }
+  assert.equal(server.rooms.get(room).gameStarted, true);
+
+  await guest.close();
+  const departure = await third.nextMessage((message) => message.type === 'player_left');
+  assert.equal(departure.data.playerId, guestId);
+  assert.equal(departure.data.playerName, 'Luis');
+  const winner = await third.nextMessage((message) => message.type === 'abandonment_winner');
+  assert.deepEqual(winner.data, { playerId: thirdId, playerName: 'Eva' });
+  await third.nextMessage((message) => message.type === 'room_state');
+  await third.nextMessage((message) => message.type === 'score_update');
+  const roomState = server.rooms.get(room);
+  assert.equal(roomState.gameStarted, false);
+  assert.equal(roomState.phase, 'lobby');
+  assert.equal(roomState.players.get(thirdId).board.size, 0);
 });
 
 test('validates pending moves and applies both players together using shared dice', async (t) => {

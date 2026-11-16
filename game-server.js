@@ -212,20 +212,12 @@ class BrillantServer {
 
   leaveRoom(socket, state) {
     const { room, player } = this.requirePlayer(state);
-    room.players.delete(player.id);
-    room.gamePlayerIds.delete(player.id);
-    room.pendingMoves.delete(player.id);
     state.roomCode = null;
     state.playerId = null;
-    this.resetLobbyIfUnderpopulated(room);
-    const events = [];
-    if (room.players.size === 0) {
-      this.rooms.delete(room.code);
-    } else {
-      events.push(...this.roomStateEvents(room), this.scoreEvent(room));
-      if (this.allPlayersConfirmed(room)) this.completeRound(room, events);
-    }
-    return { data: { left: true }, events };
+    return {
+      data: { left: true },
+      events: this.removePlayerFromRoom(room, player, 'voluntary'),
+    };
   }
 
   submitInitialBoard(socket, state, payload) {
@@ -367,20 +359,48 @@ class BrillantServer {
     if (!room) return;
     const player = room.players.get(state.playerId);
     if (!player) return;
+    state.roomCode = null;
+    state.playerId = null;
+    for (const event of this.removePlayerFromRoom(room, player, 'disconnected')) {
+      this.emit(event.sockets, event.type, event.data);
+    }
+  }
+
+  removePlayerFromRoom(room, player, reason) {
+    const activeGame = room.gameStarted && !room.gameOver && room.gamePlayerIds.has(player.id);
     room.players.delete(player.id);
     room.gamePlayerIds.delete(player.id);
     room.pendingMoves.delete(player.id);
-    this.resetLobbyIfUnderpopulated(room);
+
     if (room.players.size === 0) {
       this.rooms.delete(room.code);
-    } else {
-      this.broadcastRoomState(room);
-      this.broadcastScore(room);
-      const events = [];
-      if (this.allPlayersConfirmed(room)) this.completeRound(room, events);
-      this.appendGameOverIfComplete(room, events);
-      for (const event of events) this.emit(event.sockets, event.type, event.data);
+      return [];
     }
+
+    const sockets = [...room.players.values()].map((roomPlayer) => roomPlayer.socket);
+    const events = [{
+      sockets,
+      type: 'player_left',
+      data: { playerId: player.id, playerName: player.name, reason },
+    }];
+
+    if (activeGame && room.players.size === 1) {
+      const winner = room.players.values().next().value;
+      events.push({
+        sockets,
+        type: 'abandonment_winner',
+        data: { playerId: winner.id, playerName: winner.name },
+      });
+      this.resetGameToLobby(room);
+      events.push(...this.roomStateEvents(room), this.scoreEvent(room));
+      return events;
+    }
+
+    this.resetLobbyIfUnderpopulated(room);
+    events.push(...this.roomStateEvents(room), this.scoreEvent(room));
+    if (this.allPlayersConfirmed(room)) this.completeRound(room, events);
+    if (reason === 'disconnected') this.appendGameOverIfComplete(room, events);
+    return events;
   }
 
   validateInitialAssignments(map, entries) {
@@ -510,6 +530,24 @@ class BrillantServer {
       player.ready = false;
       player.submitted = false;
       player.board = new Map();
+    }
+  }
+
+  resetGameToLobby(room) {
+    room.gameStarted = false;
+    room.gameOver = false;
+    room.phase = 'lobby';
+    room.dice = null;
+    room.pendingMoves.clear();
+    room.gamePlayerIds.clear();
+    room.zoneWinners = [];
+    room.scores = new Map();
+    for (const player of room.players.values()) {
+      player.ready = false;
+      player.submitted = false;
+      player.finished = false;
+      player.board = new Map();
+      room.scores.set(player.id, { playerId: player.id, playerName: player.name, total: 0 });
     }
   }
 
