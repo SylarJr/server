@@ -23,6 +23,27 @@ Windows para redes privadas. Los clientes pueden conectarse con:
 Para descubrir la IP local del equipo en Windows, ejecuta `ipconfig` y usa la
 dirección IPv4 de la interfaz conectada a la misma red Wi-Fi.
 
+## Publicar en Render
+
+1. Sube este repositorio a GitHub.
+2. En Render, crea un **New + → Web Service** y conecta el repositorio.
+3. Si este repositorio contiene solo el servidor, deja **Root Directory** vacío.
+   Si el servidor está dentro de una carpeta de un repositorio mayor, indica esa
+   carpeta.
+4. Configura **Runtime** como `Node`, **Build Command** como `npm ci` y
+   **Start Command** como `npm start`. No hace falta configurar manualmente el
+   puerto: el servidor usa la variable `PORT` que Render le asigna.
+5. Crea el servicio y espera a que el despliegue termine. Render mostrará una
+   dirección como `https://<nombre-del-servicio>.onrender.com`.
+6. En la configuración del cliente Flutter, usa la misma dirección con el
+   protocolo WebSocket seguro: `wss://<nombre-del-servicio>.onrender.com`.
+   Sustituye la URL local `ws://...:3000` por esa URL para las conexiones
+   publicadas.
+
+El servicio mantiene las salas y las partidas en memoria. Usa una sola
+instancia: las salas no se comparten entre varias instancias y se pierden cuando
+el proceso se reinicia o se vuelve a desplegar.
+
 ## Protocolo
 
 Cada acción usa `{ "type": "...", "requestId": "...", "payload": { ... } }`.
