@@ -7,6 +7,7 @@ const MAX_NAME_LENGTH = 24;
 const MAX_REQUEST_ID_LENGTH = 128;
 const MAX_CACHED_RESPONSES = 500;
 const BOARD_SIZE = 7;
+const DEFAULT_RECONNECT_GRACE_MS = 5 * 60 * 1000;
 
 class RequestError extends Error {}
 
@@ -27,8 +28,15 @@ function isIntegerInRange(value, min, max) {
 }
 
 class BrillantServer {
-  constructor({ host = '0.0.0.0', port = 3000, diceRoller = randomDice } = {}) {
+  constructor({
+    host = '0.0.0.0',
+    port = 3000,
+    diceRoller = randomDice,
+    reconnectGraceMs = DEFAULT_RECONNECT_GRACE_MS,
+  } = {}) {
     this.diceRoller = diceRoller;
+    this.reconnectGraceMs = reconnectGraceMs;
+    this.shuttingDown = false;
     this.rooms = new Map();
     this.connections = new Map();
     this.wss = new WebSocket.Server({ host, port, maxPayload: MAX_MESSAGE_BYTES });
@@ -45,6 +53,12 @@ class BrillantServer {
   }
 
   async close() {
+    this.shuttingDown = true;
+    for (const room of this.rooms.values()) {
+      for (const player of room.players.values()) {
+        clearTimeout(player.disconnectTimer);
+      }
+    }
     for (const socket of this.connections.keys()) {
       socket.close(1001, 'Server shutting down');
     }
@@ -179,8 +193,71 @@ class BrillantServer {
     if (!code) throw new RequestError('code es obligatorio.');
     const room = this.rooms.get(code);
     if (!room) throw new RequestError('No existe una sala con ese código.');
-    if (room.gameStarted) throw new RequestError('La partida ya comenzó; no se aceptan más jugadores.');
-    if (room.phase !== 'lobby') throw new RequestError('La sala ya pasó a la preparación del tablero.');
+    if (payload.playerId !== undefined) {
+      const player = room.players.get(payload.playerId);
+      if (!player) throw new RequestError('No se puede recuperar esta sesión de jugador.');
+      if (player.disconnectedAt === null || player.disconnectedAt === undefined) {
+        throw new RequestError('Este jugador ya está conectado.');
+      }
+      if (Date.now() - player.disconnectedAt >= this.reconnectGraceMs) {
+        for (const event of this.removePlayerFromRoom(room, player, 'disconnected')) {
+          this.emit(event.sockets, event.type, event.data);
+        }
+        throw new RequestError('Se agotó el plazo de 5 minutos para volver a la partida.');
+      }
+      clearTimeout(player.disconnectTimer);
+      player.disconnectTimer = null;
+      player.disconnectedAt = null;
+      player.socket = socket;
+      state.roomCode = code;
+      state.playerId = player.id;
+      const events = this.roomStateEvents(room);
+      events.push({
+        sockets: [socket],
+        type: 'board_state',
+        data: this.boardData(room, player),
+      });
+      for (const otherPlayer of room.players.values()) {
+        if (otherPlayer.id === player.id) continue;
+        events.push({
+          sockets: [socket],
+          type: 'board_state',
+          data: this.boardData(room, otherPlayer),
+        });
+      }
+      events.push({
+        sockets: [socket],
+        type: 'score_update',
+        data: this.scoreSnapshot(room),
+      });
+      if (room.gameStarted) {
+        events.push({
+          sockets: [socket],
+          type: 'game_started',
+          data: this.roomData(room, player),
+        });
+        if (room.dice) {
+          events.push({
+            sockets: [socket],
+            type: 'dice_rolled',
+            data: {
+              values: [...room.dice],
+              confirmedPlayerIds: [...room.gamePlayerIds].filter((playerId) => {
+                const activePlayer = room.players.get(playerId);
+                return activePlayer && !activePlayer.finished;
+              }),
+            },
+          });
+        }
+      }
+      return { data: this.roomData(room, player), events };
+    }
+    if (room.gameStarted) {
+      throw new RequestError('La partida ya comenzó; no se aceptan más jugadores.');
+    }
+    if (room.phase !== 'lobby') {
+      throw new RequestError('La partida está en curso; no se aceptan más jugadores.');
+    }
     const name = this.validatePlayerName(payload.playerName);
     const player = this.newPlayer(name, socket, room.mapId);
     room.players.set(player.id, player);
@@ -354,13 +431,26 @@ class BrillantServer {
 
   onDisconnect(socket, state) {
     this.connections.delete(socket);
-    if (!state.roomCode) return;
+    if (this.shuttingDown || !state.roomCode) return;
     const room = this.rooms.get(state.roomCode);
     if (!room) return;
     const player = room.players.get(state.playerId);
     if (!player) return;
     state.roomCode = null;
     state.playerId = null;
+    player.disconnectedAt = Date.now();
+    player.disconnectTimer = setTimeout(
+      () => this.expireDisconnectedPlayer(room.code, player.id),
+      this.reconnectGraceMs,
+    );
+    player.disconnectTimer.unref();
+  }
+
+  expireDisconnectedPlayer(roomCode, playerId) {
+    const room = this.rooms.get(roomCode);
+    const player = room?.players.get(playerId);
+    if (!player || player.disconnectedAt === null || player.disconnectedAt === undefined) return;
+    if (Date.now() - player.disconnectedAt < this.reconnectGraceMs) return;
     for (const event of this.removePlayerFromRoom(room, player, 'disconnected')) {
       this.emit(event.sockets, event.type, event.data);
     }
@@ -368,6 +458,8 @@ class BrillantServer {
 
   removePlayerFromRoom(room, player, reason) {
     const activeGame = room.gameStarted && !room.gameOver && room.gamePlayerIds.has(player.id);
+    clearTimeout(player.disconnectTimer);
+    player.disconnectTimer = null;
     room.players.delete(player.id);
     room.gamePlayerIds.delete(player.id);
     room.pendingMoves.delete(player.id);
@@ -446,6 +538,8 @@ class BrillantServer {
       board: new Map(),
       submitted: false,
       finished: false,
+      disconnectedAt: null,
+      disconnectTimer: null,
     };
   }
 

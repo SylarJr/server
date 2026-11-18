@@ -63,11 +63,17 @@ tirada, `place_number` (con `ready: true`) y `skip_turn` registran una acción
 pendiente por jugador. La respuesta mantiene `ok: true` y `pending: true` si
 faltan confirmaciones; la acción del último jugador también responde `ok: true`,
 pero con `pending: false`, porque en esa misma operación se aplica la ronda.
-Cuando alguien abandona o se desconecta, los jugadores restantes reciben
+Cuando alguien abandona voluntariamente, los jugadores restantes reciben
 `player_left` con `playerId` y `playerName`. Si la partida estaba activa y queda
 un único jugador, el mismo evento incluye `winnerPlayerId`; después la sala
 vuelve al lobby con el tablero y la puntuación reiniciados. Si quedan varios
 jugadores no se declara ganador por abandono.
+
+Al perder la conexión, el jugador conserva su sesión durante cinco minutos.
+Puede volver a la sala enviando `join_room` con el `code` de la sala y su
+`playerId` (devuelto al crear o unirse a la sala). Recupera su tablero y el
+estado actual de la partida. Si no vuelve antes de que venza el plazo, se le
+elimina de la sala y no podrá recuperar esa sesión.
 El servidor envía el estado actualizado de cada tablero y genera inmediatamente
 una pareja compartida. `dice_rolled` incluye
 `values` y los `confirmedPlayerIds` de todos los jugadores activos de la ronda.

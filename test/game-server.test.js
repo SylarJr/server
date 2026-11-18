@@ -60,8 +60,14 @@ async function setupRoom({
   mapId = 0,
   diceRoller = () => [1, 2],
   playerNames = ['Ana', 'Luis'],
+  reconnectGraceMs,
 } = {}) {
-  const server = await startServer({ host: '127.0.0.1', port: 0, diceRoller });
+  const server = await startServer({
+    host: '127.0.0.1',
+    port: 0,
+    diceRoller,
+    ...(reconnectGraceMs === undefined ? {} : { reconnectGraceMs }),
+  });
   const players = await Promise.all(playerNames.map(() => connect(server)));
   const [host, guest] = players;
   const created = await host.request('create_room', { mapId, playerName: playerNames[0] });
@@ -198,6 +204,49 @@ test('creates and joins rooms, rejects unknown codes, and deduplicates request I
   ]);
 });
 
+test('rejects new players after a room starts preparing or playing', async (t) => {
+  const server = await startServer({ host: '127.0.0.1', port: 0 });
+  const host = await connect(server);
+  const guest = await connect(server);
+  const newcomer = await connect(server);
+  t.after(async () => {
+    await Promise.all([host.close(), guest.close(), newcomer.close()]);
+    await server.close();
+  });
+
+  const created = await host.request('create_room', {
+    mapId: 0,
+    playerName: 'Ana',
+  });
+  await guest.request('join_room', {
+    code: created.data.code,
+    playerName: 'Luis',
+  });
+  await host.nextMessage((message) => message.type === 'room_state');
+  await guest.nextMessage((message) => message.type === 'room_state');
+
+  const room = server.rooms.get(created.data.code);
+  room.phase = 'initial_board';
+
+  const preparing = await newcomer.request('join_room', {
+    code: created.data.code,
+    playerName: 'Eva',
+  });
+  assert.equal(preparing.ok, false);
+  assert.match(preparing.error, /partida está en curso|preparación/);
+  assert.equal(room.players.size, 2);
+
+  room.phase = 'game';
+  room.gameStarted = true;
+  const playing = await newcomer.request('join_room', {
+    code: created.data.code,
+    playerName: 'Eva',
+  });
+  assert.equal(playing.ok, false);
+  assert.match(playing.error, /partida ya comenzó/);
+  assert.equal(room.players.size, 2);
+});
+
 test('starts only after every player submits a valid board and is ready', async (t) => {
   let rollCount = 0;
   const server = await startServer({
@@ -311,13 +360,19 @@ test('starts only after every player submits a valid board and is ready', async 
   assert.deepEqual(secondDice.data.confirmedPlayerIds, firstDice.data.confirmedPlayerIds);
 });
 
-test('announces disconnected players and deletes an empty room after leave', async (t) => {
-  const server = await startServer({ host: '127.0.0.1', port: 0 });
+test('removes disconnected players after the reconnect grace period', async (t) => {
+  const server = await startServer({
+    host: '127.0.0.1',
+    port: 0,
+    reconnectGraceMs: 30,
+  });
   const host = await connect(server);
   const guest = await connect(server);
+  let returningPlayer;
   t.after(async () => {
     await host.close();
     await guest.close();
+    await returningPlayer?.close();
     await server.close();
   });
 
@@ -334,10 +389,58 @@ test('announces disconnected players and deletes an empty room after leave', asy
   const state = await guest.nextMessage((message) => message.type === 'room_state');
   assert.equal(state.data.players.length, 1);
   assert.equal(state.data.players[0].name, 'Luis');
+  assert.equal(server.rooms.get(created.data.code).players.has(created.data.playerId), false);
+
+  returningPlayer = await connect(server);
+  const reconnect = await returningPlayer.request('join_room', {
+    code: created.data.code,
+    playerId: created.data.playerId,
+  });
+  assert.equal(reconnect.ok, false);
+  assert.match(reconnect.error, /No se puede recuperar/);
 
   const left = await guest.request('leave_room');
   assert.equal(left.ok, true);
   assert.equal(server.rooms.size, 0);
+});
+
+test('reconnects a disconnected player to the same active game within the grace period', async (t) => {
+  const { server, host, guest, hostId, guestId, room } = await setupRoom({
+    reconnectGraceMs: 1000,
+  });
+  let returningPlayer;
+  t.after(async () => {
+    await host.close();
+    await guest.close();
+    await returningPlayer?.close();
+    await server.close();
+  });
+
+  const before = server.rooms.get(room).players.get(hostId);
+  const originalDice = [...server.rooms.get(room).dice];
+  await host.close();
+  returningPlayer = await connect(server);
+  const resumed = await returningPlayer.request('join_room', {
+    code: room,
+    playerId: hostId,
+  });
+  assert.equal(resumed.ok, true, resumed.error);
+  assert.equal(resumed.data.playerId, hostId);
+  assert.equal(server.rooms.get(room).players.get(hostId), before);
+  assert.equal(server.rooms.get(room).players.get(hostId).socket.readyState, WebSocket.OPEN);
+
+  await guest.nextMessage((message) => message.type === 'room_state');
+  await returningPlayer.nextMessage((message) => message.type === 'room_state');
+  const boards = [];
+  boards.push(await returningPlayer.nextMessage((message) => message.type === 'board_state'));
+  boards.push(await returningPlayer.nextMessage((message) => message.type === 'board_state'));
+  assert.deepEqual(boards.map(({ data }) => data.playerId).sort(), [hostId, guestId].sort());
+  await returningPlayer.nextMessage((message) => message.type === 'score_update');
+  await returningPlayer.nextMessage((message) => message.type === 'game_started');
+  const dice = await returningPlayer.nextMessage((message) => message.type === 'dice_rolled');
+  assert.deepEqual(dice.data.values, originalDice);
+  assert.deepEqual(dice.data.confirmedPlayerIds, [hostId, guestId]);
+  assert.equal(guest.messages.some((message) => message.type === 'player_left'), false);
 });
 
 test('voluntary departure awards the sole survivor and resets the room for another game', async (t) => {
@@ -401,6 +504,7 @@ test('voluntary departure awards the sole survivor and resets the room for anoth
 test('disconnecting one of several active players does not declare a winner', async (t) => {
   const { server, host, guest, third, hostId, guestId, thirdId, room } = await setupRoom({
     playerNames: ['Ana', 'Luis', 'Eva'],
+    reconnectGraceMs: 30,
   });
   t.after(async () => {
     await host.close();
